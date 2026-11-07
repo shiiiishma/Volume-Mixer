@@ -76,6 +76,16 @@ public final class MixerViewModel {
         AudioDeviceManager.shared.setMasterMute(self.isMasterMuted)
     }
     
+    private func effectiveGain(for app: AudioAppItem) -> Float {
+        if isMuteAll || app.isMuted {
+            return 0.0
+        }
+        // Note: The physical output device already applies the system Master Volume
+        // at the hardware/DAC stage to all streams. Therefore, the tap session gain
+        // is purely the per-app volume multiplier (app.volume).
+        return app.volume
+    }
+    
     public func refreshApps() {
         let currentApps = AudioProcessTracker.shared.fetchActiveAudioApps()
         
@@ -120,7 +130,7 @@ public final class MixerViewModel {
         apps[index].volume = volume
         savePreference(for: apps[index])
         if let existing = activeTaps[pid] {
-            existing.updateVolume(volume)
+            existing.updateVolume(effectiveGain(for: apps[index]))
         }
         evaluateTapRequirement(for: index)
     }
@@ -130,7 +140,7 @@ public final class MixerViewModel {
         apps[index].isMuted.toggle()
         savePreference(for: apps[index])
         if let existing = activeTaps[pid] {
-            existing.updateMute(apps[index].isMuted)
+            existing.updateVolume(effectiveGain(for: apps[index]))
         }
         evaluateTapRequirement(for: index)
     }
@@ -158,6 +168,9 @@ public final class MixerViewModel {
         for i in 0..<apps.count {
             apps[i].isMuted = isMuteAll
             savePreference(for: apps[i])
+            if let session = activeTaps[apps[i].pid] {
+                session.updateVolume(effectiveGain(for: apps[i]))
+            }
             evaluateTapRequirement(for: i)
         }
     }
@@ -173,24 +186,12 @@ public final class MixerViewModel {
         }
     }
     
-    private func preferenceKey(for app: AudioAppItem) -> String {
-        return app.bundleID.isEmpty ? app.name : app.bundleID
-    }
-    
-    private func savePreference(for app: AudioAppItem) {
-        let prefKey = preferenceKey(for: app)
-        if app.volume >= 0.999 && !app.isMuted && app.selectedDeviceUID == nil {
-            AudioSettingsStore.shared.removePreference(for: prefKey)
-        } else {
-            let pref = AppAudioPreference(volume: app.volume, isMuted: app.isMuted, deviceUID: app.selectedDeviceUID)
-            AudioSettingsStore.shared.savePreference(pref, for: prefKey)
-        }
-    }
-    
     private func evaluateTapRequirement(for index: Int) {
         let app = apps[index]
         let targetUID = app.selectedDeviceUID ?? defaultDeviceUID
         
+        let targetGain = effectiveGain(for: app)
+        // A tap is needed only when the user explicitly attenuated the app (< 0.999), muted it, or redirected output
         let needsTap = (app.volume < 0.999 || app.isMuted || app.selectedDeviceUID != nil)
         
         if needsTap {
@@ -208,8 +209,7 @@ public final class MixerViewModel {
             
             if let existingSession = activeTaps[app.pid] {
                 existingSession.updateProcesses(targetIDs)
-                existingSession.updateVolume(app.volume)
-                existingSession.updateMute(app.isMuted)
+                existingSession.updateVolume(targetGain)
                 existingSession.updateOutputDevice(uid: targetUID)
             } else {
                 do {
@@ -217,7 +217,7 @@ public final class MixerViewModel {
                         processObjectIDs: targetIDs,
                         pid: app.pid,
                         bundleID: app.bundleID,
-                        initialVolume: app.volume,
+                        initialVolume: targetGain,
                         isMuted: app.isMuted,
                         outputDeviceUID: targetUID
                     )
@@ -257,17 +257,29 @@ public final class MixerViewModel {
                     if let session = self.activeTaps[pid] {
                         let rawPeak = session.getAndResetPeak()
                         let decayed = self.apps[i].peakLevel * 0.72
-                        let effective = self.apps[i].isMuted ? 0.0 : max(rawPeak, decayed)
-                        self.apps[i].peakLevel = min(1.0, effective)
+                        let effective = (self.isMasterMuted || self.isMuteAll || self.apps[i].isMuted) ? 0.0 : max(rawPeak, decayed)
+                        self.apps[i].peakLevel = effective
                     } else {
-                        if self.apps[i].peakLevel > 0.01 {
-                            self.apps[i].peakLevel *= 0.72
-                        } else {
+                        if self.apps[i].peakLevel > 0 {
                             self.apps[i].peakLevel = 0.0
                         }
                     }
                 }
             }
         }
+    }
+    
+    private func savePreference(for app: AudioAppItem) {
+        let key = preferenceKey(for: app)
+        let pref = AppAudioPreference(
+            volume: app.volume,
+            isMuted: app.isMuted,
+            deviceUID: app.selectedDeviceUID
+        )
+        AudioSettingsStore.shared.savePreference(pref, for: key)
+    }
+    
+    private func preferenceKey(for app: AudioAppItem) -> String {
+        return app.bundleID.isEmpty ? "name:\(app.name)" : "bundle:\(app.bundleID)"
     }
 }
