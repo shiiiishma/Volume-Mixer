@@ -1,5 +1,6 @@
 import Foundation
 import CoreAudio
+import AudioToolbox
 import Accelerate
 import AppKit
 import os.lock
@@ -89,9 +90,24 @@ public final class ProcessTapSession: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let changed = Set(processObjectIDs) != Set(newProcesses)
         processObjectIDs = newProcesses
+        let currentTapID = tapID
         os_unfair_lock_unlock(&lock)
         
-        if changed {
+        if changed && !newProcesses.isEmpty {
+            if currentTapID != kAudioObjectUnknown {
+                if #available(macOS 14.2, *) {
+                    let tap = AudioHardwareTap(id: currentTapID)
+                    let newDesc = CATapDescription(stereoMixdownOfProcesses: newProcesses)
+                    newDesc.muteBehavior = .mutedWhenTapped
+                    do {
+                        try tap.setDescription(newDesc)
+                        return
+                    } catch {
+                        NSLog("[ProcessTapSession] setDescription failed, recreating tap: \(error)")
+                    }
+                }
+            }
+            
             stopTap()
             do {
                 try startTap()
@@ -118,13 +134,13 @@ public final class ProcessTapSession: @unchecked Sendable {
     }
     
     private func startTap() throws {
-        // 1. Create CATapDescription
-        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
-        
-        if #available(macOS 14.2, *) {
-            tapDescription.processes = self.processObjectIDs
-            tapDescription.muteBehavior = .mutedWhenTapped
+        guard !processObjectIDs.isEmpty else {
+            throw NSError(domain: "AudioEngine", code: -1, userInfo: [NSLocalizedDescriptionKey: "No processes to tap"])
         }
+        
+        // 1. Create CATapDescription with stereo mixdown of target processes
+        let tapDescription = CATapDescription(stereoMixdownOfProcesses: self.processObjectIDs)
+        tapDescription.muteBehavior = .mutedWhenTapped
         
         var newTapID: AudioObjectID = kAudioObjectUnknown
         let tapStatus = AudioHardwareCreateProcessTap(tapDescription, &newTapID)
@@ -136,6 +152,7 @@ public final class ProcessTapSession: @unchecked Sendable {
         // 2. Create Aggregate Device routing to selected output device
         let targetDeviceUID = self.outputDeviceUID
         let aggregateUID = "com.antigravity.tap.\(pid).\(UUID().uuidString)"
+        let tapUID = tapDescription.uuid.uuidString
         
         let desc: [String: Any] = [
             kAudioAggregateDeviceNameKey: "AntigravityTap-\(pid)",
@@ -146,10 +163,11 @@ public final class ProcessTapSession: @unchecked Sendable {
             ],
             kAudioAggregateDeviceTapListKey: [
                 [
-                    kAudioSubTapUIDKey: aggregateUID + ".tap",
-                    kAudioSubTapDriftCompensationKey: true
+                    kAudioSubTapUIDKey: tapUID,
+                    kAudioSubTapDriftCompensationKey: 1
                 ]
-            ]
+            ],
+            kAudioAggregateDeviceIsPrivateKey: 1
         ]
         
         var newAggregateID: AudioDeviceID = kAudioObjectUnknown
@@ -209,61 +227,57 @@ public final class ProcessTapSession: @unchecked Sendable {
         let inBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outBuffers = UnsafeMutableAudioBufferListPointer(output)
         
-        let bufferCount = min(inBuffers.count, outBuffers.count)
-        guard bufferCount > 0 else { return }
-        
-        // Ensure we have a GainRampProcessor for each channel
-        if channelProcessors.count < bufferCount {
-            os_unfair_lock_lock(&lock)
-            let effectiveGain = isMutedState ? 0.0 : currentVolume
-            while channelProcessors.count < bufferCount {
-                channelProcessors.append(GainRampProcessor(initialGain: effectiveGain, rampFrames: 128))
-            }
-            os_unfair_lock_unlock(&lock)
+        guard let inBuf = inBuffers.first,
+              let outBuf = outBuffers.first,
+              let inData = inBuf.mData?.assumingMemoryBound(to: Float.self),
+              let outData = outBuf.mData?.assumingMemoryBound(to: Float.self) else {
+            return
         }
         
-        var maxPeak: Float = 0.0
+        let inBytes = Int(inBuf.mDataByteSize)
+        let outBytes = Int(outBuf.mDataByteSize)
+        let processBytes = min(inBytes, outBytes)
+        let sampleCount = processBytes / MemoryLayout<Float>.size
         
-        for i in 0..<bufferCount {
-            let inBuf = inBuffers[i]
-            let outBuf = outBuffers[i]
-            
-            guard let inData = inBuf.mData?.assumingMemoryBound(to: Float.self),
-                  let outData = outBuf.mData?.assumingMemoryBound(to: Float.self) else {
-                continue
+        if sampleCount > 0 {
+            // Peak detection for DRM silence watchdog & VU metering
+            var channelPeak: Float = 0.0
+            vDSP_maxmgv(inData, 1, &channelPeak, vDSP_Length(sampleCount))
+            if channelPeak > latestPeak {
+                latestPeak = channelPeak
             }
             
-            let frameCount = Int(inBuf.mDataByteSize) / MemoryLayout<Float>.size
-            if frameCount > 0 {
-                // Peak detection for DRM silence watchdog & VU metering
-                var channelPeak: Float = 0.0
-                vDSP_maxmgv(inData, 1, &channelPeak, vDSP_Length(frameCount))
-                if channelPeak > maxPeak {
-                    maxPeak = channelPeak
+            // DRM Watchdog check
+            if channelPeak < 0.00001 {
+                silentFrameCount += 1
+                if silentFrameCount > 60 && !reportedDRM { // ~1.5 - 2 seconds of total silence while active
+                    reportedDRM = true
+                    onDRMDetected?(true)
                 }
-                
-                // Process audio with smooth gain ramping
-                channelProcessors[i].process(input: inData, output: outData, frameCount: frameCount)
+            } else {
+                silentFrameCount = 0
+                if reportedDRM {
+                    reportedDRM = false
+                    onDRMDetected?(false)
+                }
             }
+            
+            // Process audio with smooth gain ramping
+            if channelProcessors.isEmpty {
+                os_unfair_lock_lock(&lock)
+                let effectiveGain = isMutedState ? 0.0 : currentVolume
+                channelProcessors.append(GainRampProcessor(initialGain: effectiveGain, rampFrames: 128))
+                os_unfair_lock_unlock(&lock)
+            }
+            channelProcessors[0].process(input: inData, output: outData, frameCount: sampleCount)
         }
         
-        if maxPeak > latestPeak {
-            latestPeak = maxPeak
-        }
-        
-        // DRM Watchdog check
-        if maxPeak < 0.00001 {
-            silentFrameCount += 1
-            if silentFrameCount > 60 && !reportedDRM { // ~1.5 - 2 seconds of total silence while active
-                reportedDRM = true
-                onDRMDetected?(true)
-            }
-        } else {
-            silentFrameCount = 0
-            if reportedDRM {
-                reportedDRM = false
-                onDRMDetected?(false)
-            }
+        // If output buffer is larger than input, zero out the rest
+        if outBytes > inBytes {
+            let remainingBytes = outBytes - inBytes
+            let remainingFloatPtr = outData.advanced(by: sampleCount)
+            let remainingFloats = remainingBytes / MemoryLayout<Float>.size
+            vDSP_vclr(remainingFloatPtr, 1, vDSP_Length(remainingFloats))
         }
     }
 }
@@ -275,6 +289,7 @@ public final class AudioDeviceManager: @unchecked Sendable {
     public private(set) var devices: [AudioOutputDevice] = []
     public private(set) var defaultDeviceUID: String = ""
     public var onDevicesChanged: (@Sendable () -> Void)?
+    public var onMasterVolumeChanged: (@Sendable () -> Void)?
     
     private init() {
         refreshDevices()
@@ -329,7 +344,7 @@ public final class AudioDeviceManager: @unchecked Sendable {
         self.devices = outputList
     }
     
-    public func getDefaultOutputDeviceUID() -> String {
+    public func getDefaultOutputDeviceID() -> AudioDeviceID {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -345,8 +360,102 @@ public final class AudioDeviceManager: @unchecked Sendable {
             &size,
             &defaultID
         )
-        guard status == noErr, defaultID != kAudioObjectUnknown else { return "" }
+        return status == noErr ? defaultID : kAudioObjectUnknown
+    }
+    
+    public func getDefaultOutputDeviceUID() -> String {
+        let defaultID = getDefaultOutputDeviceID()
+        guard defaultID != kAudioObjectUnknown else { return "" }
         return getDeviceUID(deviceID: defaultID) ?? ""
+    }
+    
+    public func setDefaultOutputDevice(uid: String) {
+        guard let dev = devices.first(where: { $0.uid == uid }) else { return }
+        var devID = dev.id
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        _ = AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            size,
+            &devID
+        )
+    }
+    
+    public func getMasterVolume() -> Float {
+        let defaultID = getDefaultOutputDeviceID()
+        guard defaultID != kAudioObjectUnknown else { return 1.0 }
+        
+        var volAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var volume: Float32 = 1.0
+        var volSize = UInt32(MemoryLayout<Float32>.size)
+        let status = AudioObjectGetPropertyData(defaultID, &volAddr, 0, nil, &volSize, &volume)
+        if status == noErr {
+            return Float(volume)
+        }
+        
+        volAddr.mSelector = kAudioDevicePropertyVolumeScalar
+        volAddr.mElement = 0
+        let status2 = AudioObjectGetPropertyData(defaultID, &volAddr, 0, nil, &volSize, &volume)
+        return status2 == noErr ? Float(volume) : 1.0
+    }
+    
+    public func setMasterVolume(_ volume: Float) {
+        let defaultID = getDefaultOutputDeviceID()
+        guard defaultID != kAudioObjectUnknown else { return }
+        
+        var volAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var newVol: Float32 = Float32(max(0.0, min(1.0, volume)))
+        let volSize = UInt32(MemoryLayout<Float32>.size)
+        let status = AudioObjectSetPropertyData(defaultID, &volAddr, 0, nil, volSize, &newVol)
+        if status != noErr {
+            volAddr.mSelector = kAudioDevicePropertyVolumeScalar
+            volAddr.mElement = 0
+            _ = AudioObjectSetPropertyData(defaultID, &volAddr, 0, nil, volSize, &newVol)
+        }
+    }
+    
+    public func isMasterMuted() -> Bool {
+        let defaultID = getDefaultOutputDeviceID()
+        guard defaultID != kAudioObjectUnknown else { return false }
+        
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var isMuted: UInt32 = 0
+        var muteSize = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(defaultID, &muteAddr, 0, nil, &muteSize, &isMuted)
+        return status == noErr && isMuted != 0
+    }
+    
+    public func setMasterMute(_ muted: Bool) {
+        let defaultID = getDefaultOutputDeviceID()
+        guard defaultID != kAudioObjectUnknown else { return }
+        
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var newMute: UInt32 = muted ? 1 : 0
+        let muteSize = UInt32(MemoryLayout<UInt32>.size)
+        _ = AudioObjectSetPropertyData(defaultID, &muteAddr, 0, nil, muteSize, &newMute)
     }
     
     private func hasOutputStreams(deviceID: AudioDeviceID) -> Bool {
@@ -408,6 +517,8 @@ public final class AudioDeviceManager: @unchecked Sendable {
         ) { [weak self] _, _ in
             self?.refreshDevices()
             self?.onDevicesChanged?()
+            self?.onMasterVolumeChanged?()
+            self?.attachDefaultDeviceVolumeListener()
         }
         
         var devAddr = AudioObjectPropertyAddress(
@@ -422,6 +533,39 @@ public final class AudioDeviceManager: @unchecked Sendable {
         ) { [weak self] _, _ in
             self?.refreshDevices()
             self?.onDevicesChanged?()
+        }
+        
+        attachDefaultDeviceVolumeListener()
+    }
+    
+    private func attachDefaultDeviceVolumeListener() {
+        let devID = getDefaultOutputDeviceID()
+        guard devID != kAudioObjectUnknown else { return }
+        
+        var volAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectAddPropertyListenerBlock(
+            devID,
+            &volAddr,
+            DispatchQueue.main
+        ) { [weak self] _, _ in
+            self?.onMasterVolumeChanged?()
+        }
+        
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectAddPropertyListenerBlock(
+            devID,
+            &muteAddr,
+            DispatchQueue.main
+        ) { [weak self] _, _ in
+            self?.onMasterVolumeChanged?()
         }
     }
 }
@@ -450,24 +594,25 @@ public final class AudioProcessTracker: @unchecked Sendable {
             nil,
             &dataSize
         )
-        guard status == noErr, dataSize > 0 else { return [] }
         
-        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.stride
-        var processIDs = [AudioObjectID](repeating: 0, count: count)
-        status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            &dataSize,
-            &processIDs
-        )
-        guard status == noErr else { return [] }
+        var caProcessIDs: [AudioObjectID] = []
+        if status == noErr && dataSize > 0 {
+            let count = Int(dataSize) / MemoryLayout<AudioObjectID>.stride
+            caProcessIDs = [AudioObjectID](repeating: 0, count: count)
+            status = AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                0,
+                nil,
+                &dataSize,
+                &caProcessIDs
+            )
+        }
         
         let ownPID = ProcessInfo.processInfo.processIdentifier
         
-        // First pass: Collect all processes
-        struct RawProcess {
+        // Collect all Core Audio process objects
+        struct CAProcessInfo {
             let objectID: AudioObjectID
             let pid: pid_t
             let bundleID: String
@@ -475,8 +620,8 @@ public final class AudioProcessTracker: @unchecked Sendable {
             let isRunning: Bool
         }
         
-        var rawList: [RawProcess] = []
-        for objID in processIDs {
+        var caList: [CAProcessInfo] = []
+        for objID in caProcessIDs {
             let pid = getPID(for: objID)
             guard pid > 0, pid != ownPID else { continue }
             
@@ -484,13 +629,14 @@ public final class AudioProcessTracker: @unchecked Sendable {
             let bundleID = getBundleID(for: objID) ?? ""
             let name = getProcessName(for: objID, pid: pid)
             
-            // Filter noise daemons that don't output user audio
-            let lower = name.lowercased()
-            if lower == "launchd" || lower == "kernel_task" || lower == "distnoted" || lower == "audiomixer" {
+            let lowerName = name.lowercased()
+            let lowerBundle = bundleID.lowercased()
+            if lowerName.contains("volume-mixer") || lowerName.contains("volume mixer") ||
+               lowerBundle.contains("volume-mixer") || lowerBundle.contains("volumemixer") {
                 continue
             }
             
-            rawList.append(RawProcess(
+            caList.append(CAProcessInfo(
                 objectID: objID,
                 pid: pid,
                 bundleID: bundleID,
@@ -499,65 +645,127 @@ public final class AudioProcessTracker: @unchecked Sendable {
             ))
         }
         
-        // Second pass: Group browser helper processes under their parent application
-        var grouped: [AudioAppItem] = []
-        var consumedObjectIDs = Set<AudioObjectID>()
+        let ignoredDaemons: Set<String> = [
+            "launchd", "kernel_task", "distnoted", "audiomixer", "callservicesd",
+            "avconferenced", "universalaccessd", "powerchime", "loginwindow",
+            "windowmanager", "coreservicesuiagent", "dock", "systemuiserver",
+            "control center", "control centre", "talagentd", "wallpaper",
+            "backgroundtaskmanagementagent", "menubaragent", "corelocationagent",
+            "siri", "accessibilityvisualsagent", "notification center",
+            "notification centre", "appssoagent", "wifiagent", "accessibilityuiserver",
+            "airplayuiagent", "textinputmenuagent", "textinputswitcher",
+            "universalcontrol", "aquaappearancehelper", "coreautha", "previewshellmac"
+        ]
         
-        // Group by bundleID (or bundle prefix)
-        for raw in rawList {
-            guard !consumedObjectIDs.contains(raw.objectID) else { continue }
-            
-            // Check if this is a helper process (e.g., Google Chrome Helper, com.google.Chrome.helper)
-            let isHelper = raw.name.contains("Helper") || raw.bundleID.contains(".helper") || raw.bundleID.contains(".WebKit.GPU")
-            
-            if !isHelper {
-                // Find any helper children
-                var childIDs: [AudioObjectID] = []
-                var anyRunning = raw.isRunning
-                
-                for other in rawList where other.objectID != raw.objectID {
-                    let isChildOfThis = (!raw.bundleID.isEmpty && other.bundleID.hasPrefix(raw.bundleID)) ||
-                                        (other.name.hasPrefix(raw.name) && other.name.contains("Helper"))
-                    if isChildOfThis {
-                        childIDs.append(other.objectID)
-                        consumedObjectIDs.insert(other.objectID)
-                        if other.isRunning { anyRunning = true }
-                    }
+        // 1. Get all currently running regular user GUI applications and non-daemon accessory apps
+        var openApps: [NSRunningApplication] = []
+        for app in NSWorkspace.shared.runningApplications {
+            guard app.processIdentifier != ownPID else { continue }
+            let name = (app.localizedName ?? "").lowercased()
+            let bundle = (app.bundleIdentifier ?? "").lowercased()
+            if name.contains("volume-mixer") || name.contains("volume mixer") ||
+               bundle.contains("volume-mixer") || bundle.contains("volumemixer") ||
+               ignoredDaemons.contains(name) || ignoredDaemons.contains(bundle) {
+                continue
+            }
+            if app.activationPolicy == .regular {
+                openApps.append(app)
+            } else if app.activationPolicy == .accessory {
+                if !bundle.hasPrefix("com.apple.") && !name.contains("agent") && !name.contains("service") && !name.contains("helper") {
+                    openApps.append(app)
                 }
-                
-                consumedObjectIDs.insert(raw.objectID)
-                grouped.append(AudioAppItem(
-                    audioObjectID: raw.objectID,
-                    pid: raw.pid,
-                    bundleID: raw.bundleID,
-                    name: raw.name,
-                    childObjectIDs: childIDs,
-                    isRunningOutput: anyRunning
-                ))
             }
         }
         
-        // Include any remaining orphan processes
-        for raw in rawList {
-            if !consumedObjectIDs.contains(raw.objectID) {
-                grouped.append(AudioAppItem(
-                    audioObjectID: raw.objectID,
-                    pid: raw.pid,
-                    bundleID: raw.bundleID,
-                    name: raw.name,
-                    childObjectIDs: [],
-                    isRunningOutput: raw.isRunning
-                ))
+        var resultList: [AudioAppItem] = []
+        var consumedPIDs = Set<pid_t>()
+        
+        for app in openApps {
+            let pid = app.processIdentifier
+            let bundleID = app.bundleIdentifier ?? ""
+            let name = app.localizedName ?? "Application"
+            consumedPIDs.insert(pid)
+            
+            // Find primary AudioObjectID
+            let primaryCA = caList.first(where: { $0.pid == pid })
+            let primaryObjID = primaryCA?.objectID ?? kAudioObjectUnknown
+            
+            // Find helper processes belonging to this app (e.g., Google Chrome Helper, WebKit.GPU)
+            let helpers = caList.filter { ca in
+                guard ca.pid != pid else { return false }
+                if !bundleID.isEmpty && (ca.bundleID.hasPrefix(bundleID) || ca.bundleID.contains(bundleID)) {
+                    return true
+                }
+                if ca.name.hasPrefix(name) && ca.name.contains("Helper") {
+                    return true
+                }
+                return false
             }
+            
+            for h in helpers {
+                consumedPIDs.insert(h.pid)
+            }
+            
+            let isPlaying = (primaryCA?.isRunning ?? false) || helpers.contains(where: { $0.isRunning })
+            
+            resultList.append(AudioAppItem(
+                audioObjectID: primaryObjID,
+                pid: pid,
+                bundleID: bundleID,
+                name: name,
+                childObjectIDs: helpers.map { $0.objectID },
+                isRunningOutput: isPlaying
+            ))
         }
         
-        // Sort: Active apps first, then alphabetically
-        return grouped.sorted {
+        // 2. Also include any accessory / menu bar app that is actively outputting sound
+        for ca in caList where ca.isRunning && !consumedPIDs.contains(ca.pid) {
+            let lower = ca.name.lowercased()
+            let lowerBundle = ca.bundleID.lowercased()
+            if lower.contains("volume-mixer") || lower.contains("volume mixer") ||
+               lowerBundle.contains("volume-mixer") || lowerBundle.contains("volumemixer") ||
+               ignoredDaemons.contains(lower) || ignoredDaemons.contains(lowerBundle) {
+                continue
+            }
+            
+            consumedPIDs.insert(ca.pid)
+            resultList.append(AudioAppItem(
+                audioObjectID: ca.objectID,
+                pid: ca.pid,
+                bundleID: ca.bundleID,
+                name: ca.name,
+                childObjectIDs: [],
+                isRunningOutput: true
+            ))
+        }
+        
+        // Sort: actively playing first, then alphabetically
+        return resultList.sorted {
             if $0.isRunningOutput != $1.isRunningOutput {
                 return $0.isRunningOutput && !$1.isRunningOutput
             }
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+    
+    public func getAudioObjectID(for pid: pid_t) -> AudioObjectID? {
+        var inPID = pid
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var objID: AudioObjectID = kAudioObjectUnknown
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            UInt32(MemoryLayout<pid_t>.size),
+            &inPID,
+            &size,
+            &objID
+        )
+        return (status == noErr && objID != kAudioObjectUnknown && objID != 0) ? objID : nil
     }
     
     private func getPID(for objectID: AudioObjectID) -> pid_t {
@@ -630,6 +838,18 @@ public final class AudioProcessTracker: @unchecked Sendable {
             &address,
             DispatchQueue.main
         ) { [weak self] _, _ in
+            self?.onProcessesChanged?()
+        }
+        
+        // Listen to app launch/terminate notifications from NSWorkspace
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.onProcessesChanged?()
+        }
+        center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.onProcessesChanged?()
+        }
+        center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             self?.onProcessesChanged?()
         }
     }

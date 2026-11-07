@@ -9,33 +9,33 @@ public final class MixerViewModel {
     public var apps: [AudioAppItem] = []
     public var devices: [AudioOutputDevice] = []
     public var defaultDeviceUID: String = ""
-    public var searchQuery: String = ""
     public var isMuteAll: Bool = false
     
+    // Master System Volume
+    public var masterVolume: Float = 1.0
+    public var isMasterMuted: Bool = false
+    
     @ObservationIgnored
-    private var activeTaps: [AudioObjectID: ProcessTapSession] = [:]
+    private var activeTaps: [pid_t: ProcessTapSession] = [:]
     
     @ObservationIgnored
     private var meterTimerTask: Task<Void, Never>?
     
-    public var filteredApps: [AudioAppItem] {
-        if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return apps
-        }
-        return apps.filter {
-            $0.name.localizedCaseInsensitiveContains(searchQuery) ||
-            $0.bundleID.localizedCaseInsensitiveContains(searchQuery)
-        }
-    }
-    
     public init() {
         refreshDevices()
+        refreshMasterVolume()
         refreshApps()
         startMeteringLoop()
         
         AudioDeviceManager.shared.onDevicesChanged = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.refreshDevices()
+            }
+        }
+        
+        AudioDeviceManager.shared.onMasterVolumeChanged = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.refreshMasterVolume()
             }
         }
         
@@ -56,6 +56,26 @@ public final class MixerViewModel {
         self.defaultDeviceUID = AudioDeviceManager.shared.defaultDeviceUID
     }
     
+    public func setDefaultOutputDevice(uid: String) {
+        AudioDeviceManager.shared.setDefaultOutputDevice(uid: uid)
+        refreshDevices()
+    }
+    
+    public func refreshMasterVolume() {
+        self.masterVolume = AudioDeviceManager.shared.getMasterVolume()
+        self.isMasterMuted = AudioDeviceManager.shared.isMasterMuted()
+    }
+    
+    public func setMasterVolume(_ volume: Float) {
+        self.masterVolume = max(0.0, min(1.0, volume))
+        AudioDeviceManager.shared.setMasterVolume(self.masterVolume)
+    }
+    
+    public func toggleMasterMute() {
+        self.isMasterMuted.toggle()
+        AudioDeviceManager.shared.setMasterMute(self.isMasterMuted)
+    }
+    
     public func refreshApps() {
         let currentApps = AudioProcessTracker.shared.fetchActiveAudioApps()
         
@@ -63,21 +83,21 @@ public final class MixerViewModel {
         for var app in currentApps {
             let prefKey = preferenceKey(for: app)
             
-            if let existing = self.apps.first(where: { $0.audioObjectID == app.audioObjectID }) {
+            if let existing = self.apps.first(where: { $0.pid == app.pid }) {
                 app.volume = existing.volume
                 app.isMuted = existing.isMuted
                 app.selectedDeviceUID = existing.selectedDeviceUID
                 app.isDRMProtected = existing.isDRMProtected
                 app.peakLevel = existing.peakLevel
             } else if let saved = AudioSettingsStore.shared.getPreference(for: prefKey) {
-                // Restore persistent preferences!
+                // Restore persistent preferences
                 app.volume = saved.volume
                 app.isMuted = saved.isMuted
                 app.selectedDeviceUID = saved.deviceUID
             }
             
             // If active tap exists, sync dynamic helper processes
-            if let session = activeTaps[app.audioObjectID] {
+            if let session = activeTaps[app.pid] {
                 session.updateProcesses(app.allTargetProcessIDs)
                 app.isTapped = true
             } else {
@@ -89,35 +109,41 @@ public final class MixerViewModel {
         
         self.apps = updatedApps
         
-        // Re-evaluate taps for any newly discovered apps with saved preferences
+        // Re-evaluate taps for any discovered apps
         for i in 0..<self.apps.count {
             evaluateTapRequirement(for: i)
         }
     }
     
-    public func setVolume(for appID: AudioObjectID, volume: Float) {
-        guard let index = apps.firstIndex(where: { $0.audioObjectID == appID }) else { return }
+    public func setVolume(for pid: pid_t, volume: Float) {
+        guard let index = apps.firstIndex(where: { $0.pid == pid }) else { return }
         apps[index].volume = volume
         savePreference(for: apps[index])
+        if let existing = activeTaps[pid] {
+            existing.updateVolume(volume)
+        }
         evaluateTapRequirement(for: index)
     }
     
-    public func toggleMute(for appID: AudioObjectID) {
-        guard let index = apps.firstIndex(where: { $0.audioObjectID == appID }) else { return }
+    public func toggleMute(for pid: pid_t) {
+        guard let index = apps.firstIndex(where: { $0.pid == pid }) else { return }
         apps[index].isMuted.toggle()
         savePreference(for: apps[index])
+        if let existing = activeTaps[pid] {
+            existing.updateMute(apps[index].isMuted)
+        }
         evaluateTapRequirement(for: index)
     }
     
-    public func setOutputDevice(for appID: AudioObjectID, deviceUID: String?) {
-        guard let index = apps.firstIndex(where: { $0.audioObjectID == appID }) else { return }
+    public func setOutputDevice(for pid: pid_t, deviceUID: String?) {
+        guard let index = apps.firstIndex(where: { $0.pid == pid }) else { return }
         apps[index].selectedDeviceUID = deviceUID
         savePreference(for: apps[index])
         evaluateTapRequirement(for: index)
     }
     
-    public func resetApp(for appID: AudioObjectID) {
-        guard let index = apps.firstIndex(where: { $0.audioObjectID == appID }) else { return }
+    public func resetApp(for pid: pid_t) {
+        guard let index = apps.firstIndex(where: { $0.pid == pid }) else { return }
         apps[index].volume = 1.0
         apps[index].isMuted = false
         apps[index].selectedDeviceUID = nil
@@ -168,14 +194,27 @@ public final class MixerViewModel {
         let needsTap = (app.volume < 0.999 || app.isMuted || app.selectedDeviceUID != nil)
         
         if needsTap {
-            if let existingSession = activeTaps[app.audioObjectID] {
+            var targetIDs = app.allTargetProcessIDs
+            if targetIDs.isEmpty {
+                if let directID = AudioProcessTracker.shared.getAudioObjectID(for: app.pid) {
+                    targetIDs = [directID]
+                    apps[index].audioObjectID = directID
+                }
+            }
+            
+            guard !targetIDs.isEmpty else {
+                return
+            }
+            
+            if let existingSession = activeTaps[app.pid] {
+                existingSession.updateProcesses(targetIDs)
                 existingSession.updateVolume(app.volume)
                 existingSession.updateMute(app.isMuted)
                 existingSession.updateOutputDevice(uid: targetUID)
             } else {
                 do {
                     let session = try ProcessTapSession(
-                        processObjectIDs: app.allTargetProcessIDs,
+                        processObjectIDs: targetIDs,
                         pid: app.pid,
                         bundleID: app.bundleID,
                         initialVolume: app.volume,
@@ -186,21 +225,20 @@ public final class MixerViewModel {
                     session.onDRMDetected = { [weak self] isDRM in
                         Task { @MainActor [weak self] in
                             guard let self = self,
-                                  let idx = self.apps.firstIndex(where: { $0.audioObjectID == app.audioObjectID }) else { return }
+                                  let idx = self.apps.firstIndex(where: { $0.pid == app.pid }) else { return }
                             self.apps[idx].isDRMProtected = isDRM
                         }
                     }
                     
-                    activeTaps[app.audioObjectID] = session
+                    activeTaps[app.pid] = session
                     apps[index].isTapped = true
                 } catch {
                     NSLog("[MixerViewModel] Failed to create tap for \(app.name): \(error)")
                 }
             }
         } else {
-            // On-demand release: destroy tap and return app to direct system audio!
-            if activeTaps[app.audioObjectID] != nil {
-                activeTaps.removeValue(forKey: app.audioObjectID)
+            if activeTaps[app.pid] != nil {
+                activeTaps.removeValue(forKey: app.pid)
                 apps[index].isTapped = false
                 apps[index].peakLevel = 0.0
             }
@@ -215,8 +253,8 @@ public final class MixerViewModel {
                 guard let self = self else { return }
                 
                 for i in 0..<self.apps.count {
-                    let appID = self.apps[i].audioObjectID
-                    if let session = self.activeTaps[appID] {
+                    let pid = self.apps[i].pid
+                    if let session = self.activeTaps[pid] {
                         let rawPeak = session.getAndResetPeak()
                         let decayed = self.apps[i].peakLevel * 0.72
                         let effective = self.apps[i].isMuted ? 0.0 : max(rawPeak, decayed)

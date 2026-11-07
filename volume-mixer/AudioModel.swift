@@ -16,9 +16,9 @@ public struct AudioOutputDevice: Identifiable, Hashable, Sendable {
 }
 
 public struct AudioAppItem: Identifiable, Sendable {
-    public var id: AudioObjectID { audioObjectID }
+    public var id: pid_t { pid }
     
-    public let audioObjectID: AudioObjectID
+    public var audioObjectID: AudioObjectID
     public let pid: pid_t
     public let bundleID: String
     public let name: String
@@ -33,7 +33,16 @@ public struct AudioAppItem: Identifiable, Sendable {
     public var peakLevel: Float
     
     public var allTargetProcessIDs: [AudioObjectID] {
-        return [audioObjectID] + childObjectIDs
+        var ids: [AudioObjectID] = []
+        if audioObjectID != kAudioObjectUnknown && audioObjectID != 0 {
+            ids.append(audioObjectID)
+        }
+        for child in childObjectIDs where child != kAudioObjectUnknown && child != 0 {
+            if !ids.contains(child) {
+                ids.append(child)
+            }
+        }
+        return ids
     }
     
     public init(

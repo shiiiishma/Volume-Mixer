@@ -1,0 +1,40 @@
+# macOS Finder & System files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode & Swift Build Artifacts
+build/
+DerivedData/
+*.moved-aside
+*.xcuserstate
+
+# Xcode User Data (personal layouts, schemes, breakpoints)
+xcuserdata/
+*.xcuserdatad
+
+# App Packages & Binaries (build outputs)
+*.app
+*.dSYM
+*.ipa
+*.pkg
+
+# Swift Package Manager
+.build/
+Packages/
+.swiftpm/
+
+# Fastlane / CI
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# Temp files
+*.tmp
+*.swp
+*~
